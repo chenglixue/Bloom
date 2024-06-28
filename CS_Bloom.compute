@@ -1,0 +1,147 @@
+#pragma region Kernel
+#pragma kernel BloomDownSample
+#pragma kernel BloomAdditiveUpSample
+#pragma kernel BloomWeightedDownSample
+#pragma kernel BloomBlendCameraColor
+#pragma endregion
+
+#pragma region Include
+#include "Packages/com.unity.render-pipelines.core/ShaderLibrary/Common.hlsl"
+#include "Packages/com.unity.render-pipelines.core/ShaderLibrary/Color.hlsl"
+#include "Packages/com.unity.render-pipelines.universal/ShaderLibrary/Core.hlsl"
+#pragma endregion
+
+#pragma region Variables
+Texture2D<float4> _SourceTex;
+Texture2D<float4> _ColorTex;
+RWTexture2D<float4> _RW_TargetTex;
+SamplerState sampler_LinearClamp;
+
+float4 _SourceTexSize;
+float4 _TargetSize;
+float _LuminanceThreshold;
+float _I_DownSampleCounts;
+float _BloomIntensity;
+#pragma endregion
+
+#pragma region Tool
+float3 ApplyThreshold(float3 color, out float luminance)
+{
+    luminance = Luminance(color);
+
+    return color * max(0.f, luminance - _LuminanceThreshold);
+}
+
+// from Next-Generation-Post-Processing-in-Call-of-Duty-Advanced-Warfare-v18.pdf
+float GetLuminanceWeight(float luminance)
+{
+    return rcp(1.f + luminance);
+}
+
+float GetLuminanceWeight(float3 color)
+{
+    float luminance = Luminance(color);
+
+    return rcp(1.f + luminance);
+}
+
+float3 SampleSourceTex(float2 center, float2 offset)
+{
+    return _SourceTex.SampleLevel(sampler_LinearClamp, center + offset, 0).rgb;
+}
+#pragma endregion
+
+#pragma region Main
+// 降采样
+[numthreads(8,8,1)]
+void BloomDownSample (uint3 id : SV_DispatchThreadID)
+{
+    float2 uv = (float2(id.xy) + 0.5f) * _TargetSize.zw;
+    float2 halfPixel = 0.5f * _TargetSize.zw;
+
+    float3 center = SampleSourceTex(uv, 0.f);
+    float3 topLeft = SampleSourceTex(uv, halfPixel * float2(-1.f, 1.f));
+    float3 topRight = SampleSourceTex(uv, halfPixel * float2(1.f, 1.f));
+    float3 bottomRight = SampleSourceTex(uv, halfPixel * float2(1.f, -1.f));
+    float3 bottomLeft = SampleSourceTex(uv, halfPixel * float2(-1.f, -1.f));
+
+    float3 blurColor = (center * 4.f + topLeft + topRight + bottomLeft + bottomRight) * rcp(8.f);
+    _RW_TargetTex[id.xy] = float4(blurColor, 1.f);
+    //_RW_TargetTex[id.xy] = float4(1, 0, 0, 1.f);
+}
+
+// 在Dual Kawase Blur升采样的基础上和低一级的Mip叠加
+[numthreads(8,8,1)]
+void BloomAdditiveUpSample (uint3 id : SV_DispatchThreadID)
+{
+    float2 uv = (float2(id.xy) + 0.5f) * _TargetSize.zw;
+    float2 onePixel = _TargetSize.zw;
+
+    float3 top2 = SampleSourceTex(uv, onePixel * float2(0.f, 2.f));
+    float3 bottom2 = SampleSourceTex(uv, onePixel * float2(0.f, -2.f));
+    float3 left2 = SampleSourceTex(uv, onePixel * float2(-2.f, 0.f));
+    float3 right2 = SampleSourceTex(uv, onePixel * float2(2.f, 0.f));
+    float3 topLeft = SampleSourceTex(uv, onePixel * float2(-1.f, 1.f));
+    float3 topRight = SampleSourceTex(uv, onePixel * float2(1.f, 1.f));
+    float3 bottomRight = SampleSourceTex(uv, onePixel * float2(1.f, -1.f));
+    float3 bottomLeft = SampleSourceTex(uv, onePixel * float2(-1.f, 1.f));
+
+    float3 blurColor = (top2 + bottom2 + left2 + right2 + 2.f * (topLeft + topRight + bottomLeft + bottomRight)) * rcp(12.f);
+    float3 preTarget = _RW_TargetTex.Load(uint3(id.xy, 0));
+
+    _RW_TargetTex[id.xy] = float4(blurColor + preTarget, 1.f);
+}
+
+// 第一次降采样时减去阈值并加权进行模糊
+[numthreads(8,8,1)]
+void BloomWeightedDownSample (uint3 id : SV_DispatchThreadID)
+{
+    float2 uv = (float2(id.xy) + 0.5f) * _TargetSize.zw;
+    float2 halfPixel = 0.5f * _TargetSize.zw;
+
+    float centerLuminance, topLeftLuminance, topRightLuminance, bottomRightLuminance, bottomLeftLuminance = 0.f;
+    float3 center = ApplyThreshold(SampleSourceTex(uv, 0.f), centerLuminance);
+    float3 topLeft = ApplyThreshold(SampleSourceTex(uv, halfPixel * float2(-1.f, 1.f)), topLeftLuminance);
+    float3 topRight = ApplyThreshold(SampleSourceTex(uv, halfPixel * float2(1.f, 1.f)), topRightLuminance);
+    float3 bottomRight = ApplyThreshold(SampleSourceTex(uv, halfPixel * float2(1.f, -1.f)), bottomRightLuminance);
+    float3 bottomLeft = ApplyThreshold(SampleSourceTex(uv, halfPixel * float2(-1.f, -1.f)), bottomLeftLuminance);
+
+    float centerWeight = GetLuminanceWeight(centerLuminance);
+    float topLeftWeight = GetLuminanceWeight(topLeftLuminance);
+    float topRightWeight = GetLuminanceWeight(topRightLuminance);
+    float bottomRightWeight = GetLuminanceWeight(bottomRightLuminance);
+    float bottomLeftWeight = GetLuminanceWeight(bottomLeftLuminance);
+
+    float3 colorSum = center * centerWeight * 4.f + topLeft * topLeftWeight + topRight * topRightWeight + bottomRight * bottomRightWeight + bottomLeft * bottomLeftWeight;
+    float3 weightSum = centerWeight * 4.f + topLeftWeight + topRightWeight + bottomRightWeight + bottomLeftWeight;
+
+    float3 blurColor = colorSum / weightSum;
+    _RW_TargetTex[id.xy] = float4(blurColor, 1.f);
+}
+
+// 最低一级Mip和原始颜色进行混合
+[numthreads(8,8,1)]
+void BloomBlendCameraColor (uint3 id : SV_DispatchThreadID)
+{
+    float2 uv = (float2(id.xy) + 0.5f) * _TargetSize.zw;
+    float2 onePixel = _TargetSize.zw;
+
+    float3 top2 = SampleSourceTex(uv, onePixel * float2(0.f, 2.f));
+    float3 bottom2 = SampleSourceTex(uv, onePixel * float2(0.f, -2.f));
+    float3 left2 = SampleSourceTex(uv, onePixel * float2(-2.f, 0.f));
+    float3 right2 = SampleSourceTex(uv, onePixel * float2(2.f, 0.f));
+    float3 topLeft = SampleSourceTex(uv, onePixel * float2(-1.f, 1.f));
+    float3 topRight = SampleSourceTex(uv, onePixel * float2(1.f, 1.f));
+    float3 bottomRight = SampleSourceTex(uv, onePixel * float2(1.f, -1.f));
+    float3 bottomLeft = SampleSourceTex(uv, onePixel * float2(-1.f, 1.f));
+
+    float3 colorTex = _ColorTex.Load(uint3(id.xy, 0));
+    float3 blurColor = (top2 + bottom2 + left2 + right2 + 2.f * (topLeft + topRight + bottomLeft + bottomRight)) * rcp(12.f);
+    
+    float3 bloomColor = colorTex + blurColor * _BloomIntensity * _I_DownSampleCounts;
+    _RW_TargetTex[id.xy] = float4(bloomColor, 1.f);
+}
+#pragma endregion
+
+
+
